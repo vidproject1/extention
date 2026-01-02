@@ -3,10 +3,7 @@
   "name": "YouTube Next Upload (Prototype)",
   "version": "0.0.1",
   "description": "Extracts current YouTube video metadata needed to find the next upload.",
-  "permissions": ["storage", "https://www.youtube.com/*"],
-  "background": {
-    "scripts": ["background.js"]
-  },
+  "permissions": ["storage", "*://youtube.com/*", "*://*.youtube.com/*"],
   "content_scripts": [
     {
       "matches": ["*://youtube.com/*", "*://*.youtube.com/*"],

@@ -710,8 +710,7 @@ function updateUiState({ nextVideoId, reason, title, detail }) {
     ui.status.textContent =
       reason === "not_on_watch"
         ? "Open a video to enable. If it doesn’t load, refresh once."
-        : 
-      reason === "loading"
+        : reason === "loading"
         ? "Finding next upload…"
         : reason === "waiting"
           ? "Waiting for video data…"
@@ -719,9 +718,7 @@ function updateUiState({ nextVideoId, reason, title, detail }) {
             ? detail || "Retrying…"
             : reason === "cached"
               ? "Loaded from cache"
-        : reason === "no_background_response"
-          ? "Background not responding"
-          : reason === "not_found"
+        : reason === "not_found"
         ? "No newer upload found"
         : reason === "missing_channel_or_video"
           ? "Missing channel/video data"
@@ -853,31 +850,6 @@ async function runLookupForCurrentVideo() {
       title: metadata?.title ?? null
     });
     return;
-  }
-
-  if (extApi?.runtime?.sendMessage) {
-    try {
-      const result = await extApi.runtime.sendMessage({
-        type: "yt_watch_metadata",
-        data: metadata
-      });
-      if (runId !== activeRunId) {
-        return;
-      }
-      if (result?.nextVideoId) {
-        await writeNextVideoCache(currentVideoId, result.nextVideoId);
-        lastLookupOutcome = "found";
-        updateUiState({
-          nextVideoId: result.nextVideoId,
-          reason: "found",
-          title: metadata?.title ?? null
-        });
-        return;
-      }
-    } catch (err) {
-      pageErrored = true;
-      console.log("[yt-next-upload] background lookup error", String(err?.message ?? err));
-    }
   }
 
   lastLookupOutcome = pageErrored ? "error" : "not_found";
