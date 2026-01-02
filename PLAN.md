@@ -161,3 +161,50 @@ Operational contingencies:
 3) Add list UI (next 3–10) and options (include Shorts/live).
 4) Add fallback modes (RSS, uploads playlist) and clear error messaging.
 
+## 13) Current Implementation (Prototype)
+
+### A) What’s implemented
+- Watch-page metadata extraction:
+  - `videoId` from URL query param `v`
+  - `channelId`, `publishDate`, `title` from watch page microformat / meta tags
+- On-page UI:
+  - Fixed-position bottom-right overlay “Next upload” button with a small status pill
+  - Button only navigates when clicked (no autoplay)
+- Settings:
+  - Option “Open next upload in a new tab” (otherwise navigates in the current tab)
+- Next-upload lookup:
+  - Parses the channel “Videos” grid in newest → oldest order.
+  - Walks video IDs until it finds the current video; returns the immediately newer neighbor.
+  - Uses continuation tokens (internal browse endpoint) to paginate if needed.
+- SPA-ish navigation handling:
+  - Re-runs on `yt-navigate-finish`, `popstate`, and a lightweight URL polling fallback.
+
+### B) How it works (high level)
+1) Content script runs on YouTube watch pages and extracts watch metadata.
+2) It asks the background script to compute `nextVideoId`.
+3) If background continuation calls are blocked (often by 403), the content script falls back to performing the same lookup from the page context and updates the UI.
+4) Clicking “Next upload” opens `https://www.youtube.com/watch?v=<nextVideoId>` in a new tab or the same tab based on settings.
+
+### C) Files
+- `manifest.json`: content script match patterns + options page wiring
+- `content-script.js`: watch extraction, overlay UI, settings read, fallback lookup
+- `background.js`: channel “Videos” parsing + continuation logic (may be blocked by 403 on some runs)
+- `options.html` / `options.js`: settings UI
+
+## 14) Known Reliability Issues (Why refresh helps)
+This prototype is scraping YouTube’s internal page data and internal continuation endpoints. Reliability can vary because:
+- YouTube sometimes blocks internal continuation calls from extension/background contexts with 403.
+- The watch page is an SPA; data blobs aren’t always in the DOM immediately, and the timing can vary.
+- YouTube can rate-limit or change response requirements (headers, visitor data, cookies).
+
+Refreshing tends to “reset” timing and sometimes changes which data is available early in page load, which is why repeated refreshes can eventually succeed.
+
+## 15) Next Steps (no code changes yet)
+If we improve reliability later, the most effective directions are:
+- Add retry with backoff for continuation requests (and stop early once current video is found).
+- Wait for YouTube data readiness signals before running the lookup.
+- Cache per-channel page segments + per-video results briefly to avoid repeated network calls during navigation.
+- Add alternative fallbacks:
+  - Uploads playlist parsing (derived playlist id)
+  - Channel RSS for recent-only cases
+

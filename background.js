@@ -150,6 +150,13 @@ function extractYtCfg(html) {
     return null;
   }
 
+  const clientName =
+    findFirstStringInText(html, /"INNERTUBE_CLIENT_NAME"\s*:\s*"([^"]+)"/) ??
+    findFirstStringInText(html, /"INNERTUBE_CONTEXT_CLIENT_NAME"\s*:\s*([0-9]+)/);
+
+  const clientVersion = findFirstStringInText(html, /"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/);
+  const visitorData = findFirstStringInText(html, /"VISITOR_DATA"\s*:\s*"([^"]+)"/);
+
   const context =
     extractJsonObjectAfterProperty(html, '"INNERTUBE_CONTEXT"') ??
     extractJsonObjectAfterProperty(html, "INNERTUBE_CONTEXT");
@@ -158,7 +165,7 @@ function extractYtCfg(html) {
     return null;
   }
 
-  return { apiKey, context };
+  return { apiKey, context, clientName, clientVersion, visitorData };
 }
 
 function extractInitialData(html) {
@@ -176,24 +183,34 @@ function extractInitialData(html) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url, { credentials: "omit" });
+  const res = await fetch(url, {
+    credentials: "include",
+    headers: {
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+  });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} for ${url}`);
+    throw new Error(`HTTP ${res.status}`);
   }
   return await res.text();
 }
 
-async function postJson(url, body) {
+async function postJson(url, body, { ytCfg, referer } = {}) {
   const res = await fetch(url, {
     method: "POST",
     headers: {
-      "content-type": "application/json"
+      "content-type": "application/json",
+      accept: "application/json",
+      ...(ytCfg?.clientName ? { "x-youtube-client-name": String(ytCfg.clientName) } : null),
+      ...(ytCfg?.clientVersion ? { "x-youtube-client-version": String(ytCfg.clientVersion) } : null),
+      ...(ytCfg?.visitorData ? { "x-goog-visitor-id": String(ytCfg.visitorData) } : null)
     },
     body: JSON.stringify(body),
-    credentials: "omit"
+    ...(referer ? { referrer: referer, referrerPolicy: "origin-when-cross-origin" } : null),
+    credentials: "include"
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} for ${url}`);
+    throw new Error(`HTTP ${res.status}`);
   }
   return await res.json();
 }
@@ -236,10 +253,14 @@ async function findNextUploadVideoId({ channelId, currentVideoId, maxPages = 20 
     const browseUrl = `https://www.youtube.com/youtubei/v1/browse?key=${encodeURIComponent(
       ytCfg.apiKey
     )}`;
-    const responseJson = await postJson(browseUrl, {
+    const responseJson = await postJson(
+      browseUrl,
+      {
       context: ytCfg.context,
       continuation: token
-    });
+      },
+      { ytCfg, referer: channelVideosUrl }
+    );
 
     const continuationItems = extractContinuationItemsFromBrowseResponse(responseJson);
     if (!continuationItems.length) {
