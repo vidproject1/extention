@@ -140,6 +140,9 @@ let ytNextUploadUi = null;
 let lastProcessedVideoId = null;
 let lastNextVideoId = null;
 let lastRunTimer = null;
+let lastLookupAtMs = 0;
+let lastLookupOutcome = null;
+let activeRunId = 0;
 
 async function loadSettings() {
   try {
@@ -155,6 +158,113 @@ async function loadSettings() {
 
 function buildNextVideoUrl(videoId) {
   return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jitterMs(baseMs, factor = 0.25) {
+  const delta = baseMs * factor;
+  const min = Math.max(0, baseMs - delta);
+  const max = baseMs + delta;
+  return Math.floor(min + Math.random() * (max - min));
+}
+
+function extractHttpStatus(err) {
+  const message = String(err?.message ?? "");
+  const m = message.match(/\bHTTP\s+(\d{3})\b/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function isRetryableHttpStatus(status) {
+  if (!status) return false;
+  if (status === 403) return true;
+  if (status === 408) return true;
+  if (status === 425) return true;
+  if (status === 429) return true;
+  if (status >= 500 && status <= 599) return true;
+  return false;
+}
+
+async function withRetries(fn, { attempts, baseDelayMs, onAttempt } = {}) {
+  const maxAttempts = Math.max(1, Number(attempts ?? 3));
+  const baseDelay = Math.max(50, Number(baseDelayMs ?? 250));
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (typeof onAttempt === "function") {
+        onAttempt({ attempt, maxAttempts });
+      }
+      return await fn({ attempt, maxAttempts });
+    } catch (err) {
+      lastErr = err;
+      const status = extractHttpStatus(err);
+      if (!isRetryableHttpStatus(status) || attempt === maxAttempts) {
+        throw err;
+      }
+      const delay = jitterMs(baseDelay * Math.pow(2, attempt - 1));
+      await sleep(delay);
+    }
+  }
+  throw lastErr ?? new Error("Retry failed");
+}
+
+function getCacheKeyForNextVideo(videoId) {
+  return `yt_next_upload_v2_${videoId}`;
+}
+
+async function readNextVideoCache(videoId, ttlMs) {
+  if (!extApi?.storage?.local || !videoId) return null;
+  try {
+    const key = getCacheKeyForNextVideo(videoId);
+    const result = await extApi.storage.local.get(key);
+    const entry = result?.[key] ?? null;
+    if (!entry || typeof entry !== "object") return null;
+    const ts = Number(entry.ts ?? 0);
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    if (Date.now() - ts > ttlMs) return null;
+    const nextVideoId = typeof entry.nextVideoId === "string" ? entry.nextVideoId : null;
+    if (!nextVideoId) return null;
+    return { nextVideoId };
+  } catch {
+    return null;
+  }
+}
+
+async function writeNextVideoCache(videoId, nextVideoId) {
+  if (!extApi?.storage?.local || !videoId) return;
+  try {
+    const key = getCacheKeyForNextVideo(videoId);
+    await extApi.storage.local.set({
+      [key]: {
+        ts: Date.now(),
+        nextVideoId: typeof nextVideoId === "string" ? nextVideoId : null
+      }
+    });
+  } catch {}
+}
+
+async function waitForWatchMetadata({ timeoutMs, intervalMs, runId } = {}) {
+  const timeout = Math.max(500, Number(timeoutMs ?? 8000));
+  const interval = Math.max(100, Number(intervalMs ?? 250));
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    if (runId !== undefined && runId !== activeRunId) {
+      return null;
+    }
+    const metadata = extractWatchMetadata();
+    const urlVideoId = getVideoIdFromLocation();
+    if (metadata?.videoId && metadata?.videoId === urlVideoId && metadata?.channelId) {
+      return metadata;
+    }
+    await sleep(interval);
+  }
+  return extractWatchMetadata();
 }
 
 function findFirstStringInText(text, regex) {
@@ -332,36 +442,46 @@ function extractInitialData(html) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url, {
-    credentials: "include",
-    headers: {
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    }
-  });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  return await res.text();
+  return await withRetries(
+    async () => {
+      const res = await fetch(url, {
+        credentials: "include",
+        headers: {
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return await res.text();
+    },
+    { attempts: 4, baseDelayMs: 250 }
+  );
 }
 
 async function postJson(url, body, { ytCfg, referrer } = {}) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json",
-      ...(ytCfg?.clientName ? { "x-youtube-client-name": String(ytCfg.clientName) } : null),
-      ...(ytCfg?.clientVersion ? { "x-youtube-client-version": String(ytCfg.clientVersion) } : null),
-      ...(ytCfg?.visitorData ? { "x-goog-visitor-id": String(ytCfg.visitorData) } : null)
+  return await withRetries(
+    async () => {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          ...(ytCfg?.clientName ? { "x-youtube-client-name": String(ytCfg.clientName) } : null),
+          ...(ytCfg?.clientVersion ? { "x-youtube-client-version": String(ytCfg.clientVersion) } : null),
+          ...(ytCfg?.visitorData ? { "x-goog-visitor-id": String(ytCfg.visitorData) } : null)
+        },
+        body: JSON.stringify(body),
+        ...(referrer ? { referrer, referrerPolicy: "origin-when-cross-origin" } : null),
+        credentials: "include"
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return await res.json();
     },
-    body: JSON.stringify(body),
-    ...(referrer ? { referrer, referrerPolicy: "origin-when-cross-origin" } : null),
-    credentials: "include"
-  });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  return await res.json();
+    { attempts: 4, baseDelayMs: 250 }
+  );
 }
 
 async function findNextUploadVideoIdViaPage({ channelId, currentVideoId, maxPages = 20 }) {
@@ -418,6 +538,69 @@ async function findNextUploadVideoIdViaPage({ channelId, currentVideoId, maxPage
     items = continuationItems;
   }
 
+  return null;
+}
+
+function extractVideoIdsFromRss(xmlText) {
+  const ids = [];
+  const re = /<yt:videoId>([^<]+)<\/yt:videoId>/g;
+  let m;
+  while ((m = re.exec(xmlText))) {
+    const id = String(m[1] ?? "").trim();
+    if (id && !ids.includes(id)) {
+      ids.push(id);
+    }
+  }
+
+  if (ids.length) {
+    return ids;
+  }
+
+  const re2 = /yt:video:([a-zA-Z0-9_-]{11})/g;
+  while ((m = re2.exec(xmlText))) {
+    const id = String(m[1] ?? "").trim();
+    if (id && !ids.includes(id)) {
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+async function fetchRssText(url) {
+  return await withRetries(
+    async () => {
+      const res = await fetch(url, {
+        credentials: "include",
+        headers: {
+          accept: "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8"
+        }
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return await res.text();
+    },
+    { attempts: 3, baseDelayMs: 250 }
+  );
+}
+
+async function findNextUploadVideoIdViaRss({ channelId, currentVideoId }) {
+  if (!channelId || !currentVideoId) {
+    return null;
+  }
+  const url = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(
+    channelId
+  )}`;
+  const xmlText = await fetchRssText(url);
+  const ids = extractVideoIdsFromRss(xmlText);
+
+  let prevVideoId = null;
+  for (const vid of ids) {
+    if (vid === currentVideoId) {
+      return prevVideoId;
+    }
+    prevVideoId = vid;
+  }
   return null;
 }
 
@@ -507,7 +690,7 @@ function ensureUi() {
   return ytNextUploadUi;
 }
 
-function updateUiState({ nextVideoId, reason, title }) {
+function updateUiState({ nextVideoId, reason, title, detail }) {
   const ui = ensureUi();
   lastNextVideoId = nextVideoId ?? null;
 
@@ -524,6 +707,12 @@ function updateUiState({ nextVideoId, reason, title }) {
     ui.status.textContent =
       reason === "loading"
         ? "Finding next upload…"
+        : reason === "waiting"
+          ? "Waiting for video data…"
+          : reason === "retrying"
+            ? detail || "Retrying…"
+            : reason === "cached"
+              ? "Loaded from cache"
         : reason === "no_background_response"
           ? "Background not responding"
           : reason === "not_found"
@@ -537,99 +726,158 @@ function updateUiState({ nextVideoId, reason, title }) {
 }
 
 async function runLookupForCurrentVideo() {
-  const videoId = getVideoIdFromLocation();
-  if (!videoId || videoId === lastProcessedVideoId) {
+  const urlVideoId = getVideoIdFromLocation();
+  if (!urlVideoId) {
     return;
   }
-  lastProcessedVideoId = videoId;
 
-  const metadata = extractWatchMetadata();
-  console.log("[yt-next-upload] extracted watch metadata", metadata);
-  updateUiState({ nextVideoId: null, reason: "loading", title: metadata?.title ?? null });
-
-  try {
-    if (!extApi) {
-      updateUiState({
-        nextVideoId: null,
-        reason: "no_background_response",
-        title: metadata?.title ?? null
-      });
-      const fallbackNextVideoId = await findNextUploadVideoIdViaPage({
-        channelId: metadata?.channelId,
-        currentVideoId: metadata?.videoId
-      });
-      console.log("[yt-next-upload] next upload fallback result", {
-        nextVideoId: fallbackNextVideoId ?? null
-      });
-      updateUiState({
-        nextVideoId: fallbackNextVideoId ?? null,
-        reason: fallbackNextVideoId ? "found" : "not_found",
-        title: metadata?.title ?? null
-      });
+  const now = Date.now();
+  if (urlVideoId === lastProcessedVideoId) {
+    const since = now - lastLookupAtMs;
+    if (lastLookupOutcome && lastLookupOutcome !== "error" && since < 15000) {
       return;
     }
-    const result = await extApi.runtime.sendMessage({
-      type: "yt_watch_metadata",
-      data: metadata
-    });
-
-    if (result === undefined) {
-      console.log("[yt-next-upload] next upload result", {
-        nextVideoId: null,
-        reason: "no_background_response"
-      });
-      updateUiState({
-        nextVideoId: null,
-        reason: "no_background_response",
-        title: metadata?.title ?? null
-      });
+    if (since < 2000) {
       return;
-    }
-
-    console.log("[yt-next-upload] next upload result", result);
-    if (result?.reason === "error") {
-      const fallbackNextVideoId = await findNextUploadVideoIdViaPage({
-        channelId: metadata?.channelId,
-        currentVideoId: metadata?.videoId
-      });
-      console.log("[yt-next-upload] next upload fallback result", {
-        nextVideoId: fallbackNextVideoId ?? null
-      });
-      updateUiState({
-        nextVideoId: fallbackNextVideoId ?? null,
-        reason: fallbackNextVideoId ? "found" : "not_found",
-        title: metadata?.title ?? null
-      });
-      return;
-    }
-    updateUiState({
-      nextVideoId: result?.nextVideoId ?? null,
-      reason: result?.reason ?? "unknown",
-      title: metadata?.title ?? null
-    });
-  } catch (err) {
-    console.log("[yt-next-upload] next upload error", String(err?.message ?? err));
-    try {
-      const fallbackNextVideoId = await findNextUploadVideoIdViaPage({
-        channelId: metadata?.channelId,
-        currentVideoId: metadata?.videoId
-      });
-      console.log("[yt-next-upload] next upload fallback result", {
-        nextVideoId: fallbackNextVideoId ?? null
-      });
-      updateUiState({
-        nextVideoId: fallbackNextVideoId ?? null,
-        reason: fallbackNextVideoId ? "found" : "not_found",
-        title: metadata?.title ?? null
-      });
-    } catch (fallbackErr) {
-      console.log(
-        "[yt-next-upload] next upload fallback error",
-        String(fallbackErr?.message ?? fallbackErr)
-      );
-      updateUiState({ nextVideoId: null, reason: "error", title: metadata?.title ?? null });
     }
   }
+
+  lastProcessedVideoId = urlVideoId;
+  lastLookupAtMs = now;
+  lastLookupOutcome = "loading";
+  const runId = ++activeRunId;
+
+  updateUiState({ nextVideoId: null, reason: "waiting" });
+  const metadata = await waitForWatchMetadata({ timeoutMs: 8000, intervalMs: 250, runId });
+  if (runId !== activeRunId) {
+    return;
+  }
+
+  console.log("[yt-next-upload] extracted watch metadata", metadata);
+
+  const channelId = metadata?.channelId ?? null;
+  const currentVideoId = metadata?.videoId ?? null;
+  if (!channelId || !currentVideoId) {
+    lastLookupOutcome = "missing_channel_or_video";
+    updateUiState({
+      nextVideoId: null,
+      reason: "missing_channel_or_video",
+      title: metadata?.title ?? null
+    });
+    return;
+  }
+
+  const cached = await readNextVideoCache(currentVideoId, 10 * 60 * 1000);
+  if (runId !== activeRunId) {
+    return;
+  }
+  if (cached?.nextVideoId) {
+    lastLookupOutcome = "cached";
+    updateUiState({
+      nextVideoId: cached.nextVideoId,
+      reason: "cached",
+      title: metadata?.title ?? null
+    });
+    return;
+  }
+
+  updateUiState({ nextVideoId: null, reason: "loading", title: metadata?.title ?? null });
+
+  let nextVideoId = null;
+  let pageErrored = false;
+
+  try {
+    nextVideoId = await withRetries(
+      async ({ attempt, maxAttempts }) => {
+        if (runId !== activeRunId) {
+          return null;
+        }
+        if (attempt > 1) {
+          updateUiState({
+            nextVideoId: null,
+            reason: "retrying",
+            title: metadata?.title ?? null,
+            detail: `Retrying… (${attempt}/${maxAttempts})`
+          });
+        }
+        return await findNextUploadVideoIdViaPage({ channelId, currentVideoId });
+      },
+      { attempts: 2, baseDelayMs: 400 }
+    );
+  } catch (err) {
+    pageErrored = true;
+    console.log("[yt-next-upload] page lookup error", String(err?.message ?? err));
+  }
+
+  if (runId !== activeRunId) {
+    return;
+  }
+
+  if (nextVideoId) {
+    await writeNextVideoCache(currentVideoId, nextVideoId);
+    lastLookupOutcome = "found";
+    updateUiState({
+      nextVideoId,
+      reason: "found",
+      title: metadata?.title ?? null
+    });
+    return;
+  }
+
+  if (pageErrored) {
+    try {
+      nextVideoId = await findNextUploadVideoIdViaRss({ channelId, currentVideoId });
+    } catch (err) {
+      console.log("[yt-next-upload] rss lookup error", String(err?.message ?? err));
+    }
+  }
+
+  if (runId !== activeRunId) {
+    return;
+  }
+
+  if (nextVideoId) {
+    await writeNextVideoCache(currentVideoId, nextVideoId);
+    lastLookupOutcome = "found";
+    updateUiState({
+      nextVideoId,
+      reason: "found",
+      title: metadata?.title ?? null
+    });
+    return;
+  }
+
+  if (extApi?.runtime?.sendMessage) {
+    try {
+      const result = await extApi.runtime.sendMessage({
+        type: "yt_watch_metadata",
+        data: metadata
+      });
+      if (runId !== activeRunId) {
+        return;
+      }
+      if (result?.nextVideoId) {
+        await writeNextVideoCache(currentVideoId, result.nextVideoId);
+        lastLookupOutcome = "found";
+        updateUiState({
+          nextVideoId: result.nextVideoId,
+          reason: "found",
+          title: metadata?.title ?? null
+        });
+        return;
+      }
+    } catch (err) {
+      pageErrored = true;
+      console.log("[yt-next-upload] background lookup error", String(err?.message ?? err));
+    }
+  }
+
+  lastLookupOutcome = pageErrored ? "error" : "not_found";
+  updateUiState({
+    nextVideoId: null,
+    reason: pageErrored ? "error" : "not_found",
+    title: metadata?.title ?? null
+  });
 }
 
 function scheduleRun() {
