@@ -636,6 +636,9 @@ function ensureUi() {
     "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif";
   button.style.backdropFilter = "blur(6px)";
   button.style.boxShadow = "0 6px 18px rgba(0,0,0,0.28)";
+  button.disabled = true;
+  button.style.opacity = "0.55";
+  button.style.cursor = "not-allowed";
 
   const status = document.createElement("div");
   status.id = "yt-next-upload-status";
@@ -651,7 +654,7 @@ function ensureUi() {
   status.style.whiteSpace = "nowrap";
   status.style.overflow = "hidden";
   status.style.textOverflow = "ellipsis";
-  status.textContent = "Waiting…";
+  status.textContent = "Open a video to enable. If it doesn’t load, refresh once.";
 
   button.addEventListener("click", async () => {
     const nextVideoId = lastNextVideoId;
@@ -705,6 +708,9 @@ function updateUiState({ nextVideoId, reason, title, detail }) {
     ui.button.style.opacity = "0.55";
     ui.button.style.cursor = "not-allowed";
     ui.status.textContent =
+      reason === "not_on_watch"
+        ? "Open a video to enable. If it doesn’t load, refresh once."
+        : 
       reason === "loading"
         ? "Finding next upload…"
         : reason === "waiting"
@@ -728,6 +734,8 @@ function updateUiState({ nextVideoId, reason, title, detail }) {
 async function runLookupForCurrentVideo() {
   const urlVideoId = getVideoIdFromLocation();
   if (!urlVideoId) {
+    lastLookupOutcome = "not_on_watch";
+    updateUiState({ nextVideoId: null, reason: "not_on_watch" });
     return;
   }
 
@@ -898,6 +906,10 @@ window.addEventListener("popstate", scheduleRun, true);
 setInterval(() => {
   const videoId = getVideoIdFromLocation();
   if (videoId && videoId !== lastProcessedVideoId) {
+    scheduleRun();
+    return;
+  }
+  if (!videoId && lastProcessedVideoId) {
     scheduleRun();
   }
 }, 1000);
