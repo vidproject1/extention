@@ -1,0 +1,18 @@
+{
+  "manifest_version": 2,
+  "name": "YouTube Next Upload (Prototype)",
+  "version": "0.0.1",
+  "description": "Extracts current YouTube video metadata needed to find the next upload.",
+  "permissions": ["storage", "*://youtube.com/*", "*://*.youtube.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["*://youtube.com/*", "*://*.youtube.com/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}
